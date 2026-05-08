@@ -5,9 +5,9 @@ v0.1 in progress. Currently exposes:
     - search_drug_adverse_events: FAERS report search with PV-aware filters
     - count_adverse_events: FAERS aggregate counts across PV pivots
     - count_reactions: shortcut for count_adverse_events with pivot='reaction'
+    - get_drug_label: most recent FDA drug label, PV-essential sections
 
 Still to come for v0.1:
-    - get_drug_label
     - search_drug_recalls
 """
 
@@ -772,6 +772,223 @@ async def count_reactions(
         country=country,
         limit=limit,
     )
+
+
+# ---------------------------------------------------------------------------
+# Helpers for get_drug_label
+# ---------------------------------------------------------------------------
+
+# The PV-essential subset of /drug/label.json sections. Returned even if
+# absent from the specific label (as null) so the LLM can distinguish
+# "no boxed warning exists for this drug" from "we forgot to look."
+_LABEL_PV_SECTIONS: tuple[str, ...] = (
+    "boxed_warning",
+    "adverse_reactions",
+    "warnings_and_cautions",
+    "contraindications",
+    "drug_interactions",
+    "indications_and_usage",
+    "dosage_and_administration",
+    "pregnancy",
+    "pediatric_use",
+    "geriatric_use",
+)
+
+
+def _build_label_search(drug_name: str) -> str:
+    """Build a /drug/label.json `search` query for broad drug-name match.
+
+    Important schema note: in the label endpoint the `openfda` enrichment
+    block is at the TOP level of each label document, NOT nested under
+    `patient.drug` as in the event endpoint. This is the same schema
+    surprise that bit us during tool 1's first smoke test - same broad
+    name pattern, different field paths.
+    """
+    return (
+        f'openfda.generic_name:"{drug_name}" '
+        f'OR openfda.brand_name:"{drug_name}" '
+        f'OR openfda.substance_name:"{drug_name}"'
+    )
+
+
+def _section_text(section_value: Any) -> str | None:
+    """Render an openFDA label section value into a single string.
+
+    openFDA returns each label section as a list of strings, one entry
+    per XML chunk in the underlying SPL document. We join them with two
+    newlines so the LLM sees one readable block per section. Returns
+    None when the section is absent or empty - meaningful PV signal
+    (e.g., a drug with no boxed warning).
+    """
+    if section_value is None:
+        return None
+    if isinstance(section_value, list):
+        non_empty = [s.strip() for s in section_value if isinstance(s, str) and s.strip()]
+        if not non_empty:
+            return None
+        return "\n\n".join(non_empty)
+    if isinstance(section_value, str):
+        s = section_value.strip()
+        return s if s else None
+    return str(section_value)
+
+
+# ---------------------------------------------------------------------------
+# Tool: get_drug_label
+# ---------------------------------------------------------------------------
+
+def _truncate_section(text: str | None, limit: int, section_name: str) -> str | None:
+    """Cap a section's text at `limit` characters, appending a recovery note.
+
+    Keeping the recovery note inline (rather than a structured flag) lets
+    the LLM read the truncation in plain language and decide whether to
+    re-call with sections=[<this>] for the full text. Sections under the
+    limit pass through unchanged.
+    """
+    if text is None:
+        return None
+    if len(text) <= limit:
+        return text
+    return (
+        text[:limit]
+        + f"\n\n[Section truncated: showing first {limit:,} of {len(text):,} "
+        f"characters. Re-call get_drug_label with sections=['{section_name}'] "
+        "and a larger max_section_chars to retrieve more of this section.]"
+    )
+
+
+@mcp.tool()
+async def get_drug_label(
+    drug_name: str,
+    sections: list[str] | None = None,
+    max_section_chars: int = 4000,
+) -> dict[str, Any]:
+    """Return the most recent FDA drug label for a drug, PV sections only.
+
+    Looks up the drug in openFDA's /drug/label.json endpoint with broad
+    name matching across generic, brand, and active substance, then
+    returns the most recently effective label. "Most recent" is decided
+    by openFDA's effective_time field, sorted descending.
+
+    By default returns ten PV-essential sections (when present):
+        - boxed_warning
+        - adverse_reactions
+        - warnings_and_cautions
+        - contraindications
+        - drug_interactions
+        - indications_and_usage
+        - dosage_and_administration
+        - pregnancy
+        - pediatric_use
+        - geriatric_use
+
+    Sections absent from the specific label come back as null rather than
+    being omitted, so the LLM (and the human reader) can distinguish
+    "this drug has no boxed warning" from "we forgot to look at that
+    section." That distinction is meaningful in pharmacovigilance.
+
+    Long sections are truncated. Adverse-reactions sections for cancer
+    drugs and complex biologics regularly run 100,000+ characters, which
+    blows the LLM context window and is rarely useful in one bite. The
+    default per-section cap is 4,000 characters (~1,000 tokens). When a
+    section is truncated, the response text ends with an explicit note
+    telling the LLM how to re-retrieve more of that section using the
+    `sections` parameter.
+
+    Important context for the calling LLM:
+        - Most recently revised label may not be the brand-name innovator
+          label; it could be a generic manufacturer's most recent
+          submission. v0.2 will add an optional manufacturer filter.
+        - Each section is a single rendered string (multiple SPL XML
+          chunks joined with two newlines).
+        - To see the full text of a long section, re-call with
+          sections=["adverse_reactions"] (or whichever) plus a larger
+          max_section_chars (e.g., 50000).
+
+    Args:
+        drug_name: Drug name to look up. Matched broadly across generic,
+            brand, and substance fields.
+        sections: Optional list of section names to return. When omitted,
+            all ten PV-essential sections are returned. Useful for
+            zooming into a specific section after seeing it truncated.
+        max_section_chars: Per-section character cap. Default 4000.
+            Sections shorter than the cap pass through unchanged.
+
+    Returns:
+        Dict with:
+            drug_name_query: echo of the input.
+            label_metadata: {generic_name, brand_name, substance_name,
+                manufacturer_name, application_number, effective_time}.
+                Each value is a list (openFDA's native shape) or null.
+                effective_time is reformatted to ISO YYYY-MM-DD.
+            sections: dict mapping each requested section name to its
+                rendered string, or null if the section is absent. Long
+                sections are truncated with an inline recovery note.
+        Or, on no-match: {"drug_name_query": ..., "error": "No FDA label
+        found matching this drug name"}.
+    """
+    target_sections = list(sections) if sections else list(_LABEL_PV_SECTIONS)
+    invalid = [s for s in target_sections if s not in _LABEL_PV_SECTIONS]
+    if invalid:
+        return {
+            "drug_name_query": drug_name,
+            "error": f"Unknown section name(s): {invalid}.",
+            "valid_sections": list(_LABEL_PV_SECTIONS),
+        }
+
+    safe_max_chars = max(500, max_section_chars)
+
+    search_query = _build_label_search(drug_name)
+
+    try:
+        response = await query_openfda(
+            endpoint="/drug/label.json",
+            params={
+                "search": search_query,
+                "sort": "effective_time:desc",
+                "limit": 1,
+            },
+        )
+    except OpenFDAError as e:
+        return {
+            "error": "openFDA label query failed",
+            "detail": str(e),
+            "drug_name_query": drug_name,
+        }
+
+    results = response.get("results", [])
+    if not results:
+        return {
+            "drug_name_query": drug_name,
+            "error": "No FDA label found matching this drug name.",
+        }
+
+    label = results[0]
+    openfda = label.get("openfda", {}) or {}
+
+    metadata = {
+        "generic_name": openfda.get("generic_name"),
+        "brand_name": openfda.get("brand_name"),
+        "substance_name": openfda.get("substance_name"),
+        "manufacturer_name": openfda.get("manufacturer_name"),
+        "application_number": openfda.get("application_number"),
+        "effective_time": format_faers_date(label.get("effective_time")),
+    }
+
+    sections_out = {
+        section: _truncate_section(
+            _section_text(label.get(section)),
+            safe_max_chars,
+            section,
+        )
+        for section in target_sections
+    }
+
+    return {
+        "drug_name_query": drug_name,
+        "label_metadata": metadata,
+        "sections": sections_out,
+    }
 
 
 # ---------------------------------------------------------------------------
