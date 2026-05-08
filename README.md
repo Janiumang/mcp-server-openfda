@@ -1,5 +1,6 @@
 # SignalBridge for openFDA
 
+[![SafeSkill 50/100](https://img.shields.io/badge/SafeSkill-50%2F100_Use%20with%20Caution-orange)](https://safeskill.dev/scan/janiumang-mcp-server-openfda)
 SignalBridge for openFDA is an experimental Model Context Protocol server that allows AI assistants to query public FDA datasets for pharmacovigilance research workflows.
 
 It connects to openFDA APIs and exposes structured tools for:
