@@ -1,14 +1,12 @@
 """SignalBridge for openFDA - MCP server entry point.
 
-v0.1 in progress. Currently exposes:
+v0.1 surface:
     - ping: trivial wiring check
     - search_drug_adverse_events: FAERS report search with PV-aware filters
     - count_adverse_events: FAERS aggregate counts across PV pivots
     - count_reactions: shortcut for count_adverse_events with pivot='reaction'
     - get_drug_label: most recent FDA drug label, PV-essential sections
-
-Still to come for v0.1:
-    - search_drug_recalls
+    - search_drug_recalls: FDA drug recalls (Form 3500A enforcement records)
 """
 
 from __future__ import annotations
@@ -989,6 +987,240 @@ async def get_drug_label(
         "label_metadata": metadata,
         "sections": sections_out,
     }
+
+
+# ---------------------------------------------------------------------------
+# Helpers for search_drug_recalls
+# ---------------------------------------------------------------------------
+
+# FDA recall classifications. FDA defines three tiers based on health risk.
+# We pass the value through to openFDA verbatim and add a human-readable
+# severity description in the tidy record so the LLM understands what the
+# class means without needing the FDA reference card.
+_RECALL_CLASS_DESCRIPTIONS: dict[str, str] = {
+    "Class I": "Most serious - use of product can cause serious health problems or death",
+    "Class II": "Use of product may cause temporary or medically reversible adverse health consequences",
+    "Class III": "Use of product is not likely to cause adverse health consequences",
+}
+
+# Recall status values openFDA uses on /drug/enforcement records.
+_VALID_RECALL_STATUSES: tuple[str, ...] = (
+    "Ongoing",
+    "Terminated",
+    "Completed",
+    "Pending",
+)
+
+_VALID_RECALL_CLASSIFICATIONS: tuple[str, ...] = tuple(_RECALL_CLASS_DESCRIPTIONS.keys())
+
+
+def _build_recall_search(
+    drug_name: str | None,
+    firm: str | None,
+    classification: str | None,
+    status: str | None,
+    start_date: str | None,
+    end_date: str | None,
+) -> str:
+    """Build the openFDA `search` query for /drug/enforcement.json.
+
+    Field-path notes for this endpoint (different from /drug/event):
+        - openfda.* lives at the top level of each record.
+        - Date filtering uses recall_initiation_date (YYYYMMDD).
+        - recalling_firm is the firm that initiated the recall.
+
+    Firm matching nuance: a single-word firm input is left unquoted so
+    openFDA's tokenizer treats it as a contains-match (catches "Pfizer
+    Inc.", "Pfizer Pharmaceuticals", etc. for input "Pfizer"). A
+    multi-word firm input is wrapped in quotes for phrase match.
+    """
+    clauses: list[str] = []
+
+    if drug_name:
+        clauses.append(
+            f'(openfda.generic_name:"{drug_name}" '
+            f'OR openfda.brand_name:"{drug_name}" '
+            f'OR openfda.substance_name:"{drug_name}")'
+        )
+
+    if firm:
+        firm_clean = firm.strip()
+        if " " in firm_clean:
+            clauses.append(f'recalling_firm:"{firm_clean}"')
+        else:
+            clauses.append(f"recalling_firm:{firm_clean}")
+
+    if classification:
+        clauses.append(f'classification:"{classification}"')
+
+    if status:
+        clauses.append(f'status:"{status}"')
+
+    if start_date or end_date:
+        start = _date_to_openfda(start_date) if start_date else "20040101"
+        end = _date_to_openfda(end_date) if end_date else "21000101"
+        clauses.append(f"recall_initiation_date:[{start} TO {end}]")
+
+    return " AND ".join(clauses)
+
+
+def _tidy_recall(raw: dict[str, Any]) -> dict[str, Any]:
+    """Reduce a /drug/enforcement record to the PV-relevant subset.
+
+    Adds a class_description alongside classification so the LLM sees
+    'Class I - Most serious...' instead of just 'Class I'. Dates are
+    ISO-formatted via format_faers_date.
+    """
+    openfda = raw.get("openfda", {}) or {}
+    classification = raw.get("classification")
+
+    return {
+        "recall_number": raw.get("recall_number"),
+        "recalling_firm": raw.get("recalling_firm"),
+        "product_description": raw.get("product_description"),
+        "reason_for_recall": raw.get("reason_for_recall"),
+        "classification": classification,
+        "class_description": _RECALL_CLASS_DESCRIPTIONS.get(classification),
+        "status": raw.get("status"),
+        "voluntary_mandated": raw.get("voluntary_mandated"),
+        "recall_initiation_date": format_faers_date(raw.get("recall_initiation_date")),
+        "termination_date": format_faers_date(raw.get("termination_date")),
+        "distribution_pattern": raw.get("distribution_pattern"),
+        "product_quantity": raw.get("product_quantity"),
+        "country": raw.get("country"),
+        "drug_generic_name": openfda.get("generic_name"),
+        "drug_brand_name": openfda.get("brand_name"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Tool: search_drug_recalls
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def search_drug_recalls(
+    drug_name: str | None = None,
+    firm: str | None = None,
+    classification: str | None = None,
+    status: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Search FDA drug recalls (openFDA /drug/enforcement endpoint).
+
+    At least one of drug_name or firm must be provided. Other filters
+    (classification, status, date range) compose with AND semantics.
+    Records are returned sorted by recall_initiation_date descending,
+    so the most recent recalls come first.
+
+    FDA recall classification reference (also surfaced inline as
+    class_description on each record):
+        - Class I: Most serious - use of product can cause serious
+          health problems or death.
+        - Class II: Use of product may cause temporary or medically
+          reversible adverse health consequences.
+        - Class III: Use of product is not likely to cause adverse
+          health consequences.
+
+    Recall status values:
+        - Ongoing: recall in progress, distribution still being recovered.
+        - Terminated: FDA has determined the firm has fulfilled the
+          recall and the product is no longer in distribution.
+        - Completed: firm has completed all recall actions, FDA review
+          pending termination.
+        - Pending: recall just initiated, status not yet classified.
+
+    Args:
+        drug_name: Drug name to search. Matched broadly across openfda
+            generic_name, brand_name, and substance_name. Optional, but
+            either drug_name or firm must be provided.
+        firm: Recalling firm name. Single-word inputs use tokenized
+            match (so "Pfizer" catches "Pfizer Inc.", "Pfizer
+            Pharmaceuticals"). Multi-word inputs use phrase match.
+        classification: Optional severity filter; one of "Class I",
+            "Class II", "Class III".
+        status: Optional status filter; one of "Ongoing", "Terminated",
+            "Completed", "Pending".
+        start_date: Optional ISO YYYY-MM-DD lower bound on
+            recall_initiation_date.
+        end_date: Optional ISO YYYY-MM-DD upper bound on
+            recall_initiation_date.
+        limit: Max records returned. Default 25, max 100. Total
+            matching count is always returned regardless.
+
+    Returns:
+        A dict with:
+            drug_name_query, firm_query: echoes of inputs.
+            total_matching: total recalls matching the filter set.
+            returned: number of records included in this response.
+            records: list of tidied recall records (see _tidy_recall).
+            narrowing_hint: optional, when total exceeds limit.
+    """
+    if not drug_name and not firm:
+        return {
+            "error": "Provide at least one of drug_name or firm.",
+        }
+
+    if classification and classification not in _VALID_RECALL_CLASSIFICATIONS:
+        return {
+            "error": f"Invalid classification: {classification!r}.",
+            "valid_classifications": list(_VALID_RECALL_CLASSIFICATIONS),
+        }
+
+    if status and status not in _VALID_RECALL_STATUSES:
+        return {
+            "error": f"Invalid status: {status!r}.",
+            "valid_statuses": list(_VALID_RECALL_STATUSES),
+        }
+
+    search_query = _build_recall_search(
+        drug_name=drug_name,
+        firm=firm,
+        classification=classification,
+        status=status,
+        start_date=start_date,
+        end_date=end_date,
+    )
+
+    safe_limit = max(1, min(limit, 100))
+
+    try:
+        page = await query_openfda(
+            endpoint="/drug/enforcement.json",
+            params={
+                "search": search_query,
+                "limit": safe_limit,
+                "sort": "recall_initiation_date:desc",
+            },
+        )
+    except OpenFDAError as e:
+        return {
+            "error": "openFDA recall query failed",
+            "detail": str(e),
+            "search_query": search_query,
+        }
+
+    total = page.get("meta", {}).get("results", {}).get("total", 0)
+    raw_records = page.get("results", [])
+    records = [_tidy_recall(r) for r in raw_records]
+
+    response: dict[str, Any] = {
+        "drug_name_query": drug_name,
+        "firm_query": firm,
+        "total_matching": total,
+        "returned": len(records),
+        "records": records,
+    }
+
+    if total > safe_limit:
+        response["narrowing_hint"] = (
+            f"Result set is large ({total} recalls, returned {len(records)}). "
+            "Consider narrowing by classification (Class I/II/III), status "
+            "(Ongoing/Terminated/Completed/Pending), date range, or firm."
+        )
+
+    return response
 
 
 # ---------------------------------------------------------------------------
