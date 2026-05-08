@@ -3,15 +3,18 @@
 v0.1 in progress. Currently exposes:
     - ping: trivial wiring check
     - search_drug_adverse_events: FAERS report search with PV-aware filters
+    - count_adverse_events: FAERS aggregate counts across PV pivots
+    - count_reactions: shortcut for count_adverse_events with pivot='reaction'
 
 Still to come for v0.1:
-    - count_adverse_events
     - get_drug_label
     - search_drug_recalls
 """
 
 from __future__ import annotations
 
+import asyncio
+import datetime
 from typing import Any
 
 from mcp.server.fastmcp import FastMCP
@@ -328,6 +331,447 @@ async def search_drug_adverse_events(
         response["narrowing_hint"] = hint
 
     return response
+
+
+# ---------------------------------------------------------------------------
+# Helpers for count_adverse_events and count_reactions
+# ---------------------------------------------------------------------------
+
+# Pivot name (LLM-facing) -> openFDA `count` field. Used for the four
+# single-call pivots. year and seriousness_subtype are multi-call and
+# handled in dedicated helpers because openFDA's `count=` aggregation
+# does not natively bucket by year and does not natively distribute
+# across the seriousness flag fields.
+_PIVOT_FIELD_MAP: dict[str, str] = {
+    "reaction": "patient.reaction.reactionmeddrapt.exact",
+    "country": "primarysource.reportercountry.exact",
+    "reporter_qualification": "primarysource.qualification",
+    "concomitant_drug": "patient.drug.openfda.generic_name.exact",
+}
+
+# FAERS public data starts 2004. Used as the lower bound for the year
+# pivot when no start_date is supplied.
+_FAERS_DATA_START_YEAR = 2004
+
+# The six FAERS seriousness subtype flags (ICH E2B element A.1.5.1.x).
+# Each is a {field, label} pair: field is the openFDA flag we count on,
+# label is the human-readable subtype name we show in the response.
+_SERIOUSNESS_SUBTYPE_FIELDS: list[tuple[str, str]] = [
+    ("seriousnessdeath", "Death"),
+    ("seriousnesslifethreatening", "Life-threatening"),
+    ("seriousnesshospitalization", "Hospitalization"),
+    ("seriousnessdisabling", "Disabling"),
+    ("seriousnesscongenitalanomali", "Congenital anomaly"),
+    ("seriousnessother", "Other medically important"),
+]
+
+VALID_PIVOTS: tuple[str, ...] = (
+    "reaction",
+    "country",
+    "year",
+    "reporter_qualification",
+    "concomitant_drug",
+    "seriousness_subtype",
+)
+
+
+def _label_pivot_count(pivot: str, item: dict[str, Any]) -> dict[str, Any]:
+    """Convert a single openFDA count-result item into our response shape.
+
+    openFDA returns count results as {"term": <raw>, "count": <n>}. We
+    rename to {"label": <human-readable>, "count": <n>} and apply
+    pivot-specific normalization:
+
+        - reaction: MedDRA case normalization (sentence case)
+        - reporter_qualification: ICH E2B code translation
+        - concomitant_drug: title-case (storage form is uppercase)
+        - country, year: passed through as strings
+    """
+    raw_term = item.get("term")
+    count = item.get("count", 0)
+
+    if pivot == "reaction":
+        label = normalize_meddra_term(raw_term)
+    elif pivot == "reporter_qualification":
+        translated = translate(REPORTER_QUALIFICATION, raw_term)
+        # Surface unknown codes rather than dropping them silently.
+        label = translated if translated is not None else f"Code {raw_term}"
+    elif pivot == "concomitant_drug":
+        label = str(raw_term).title() if raw_term else None
+    else:
+        # country, year, fallback
+        label = str(raw_term) if raw_term not in (None, "") else None
+
+    return {"label": label, "count": count}
+
+
+async def _count_by_year(
+    base_search_query: str,
+    start_date: str | None,
+    end_date: str | None,
+    api_key: str | None,
+) -> list[dict[str, Any]]:
+    """Aggregate report counts per year via concurrent range queries.
+
+    openFDA's `count=` parameter does not natively bucket by year on
+    `receivedate`. To answer "how many reports per year?" we issue one
+    concurrent query per year in the requested window, each filtering
+    receivedate to that year and reading the total from meta.results.
+
+    Year boundaries:
+        - If start_date is provided, its year is the lower bound.
+          Otherwise we use FAERS's public data start year (2004).
+        - If end_date is provided, its year is the upper bound.
+          Otherwise we use the current calendar year.
+        - If start > end, returns empty.
+
+    Returns counts in chronological order so the response reads as a
+    trend timeline. Zero-count years are kept (intentionally) — they
+    are PV-meaningful (e.g. drug pre-approval, reporting gap).
+    """
+    try:
+        start_year = int(start_date[:4]) if start_date else _FAERS_DATA_START_YEAR
+    except (TypeError, ValueError):
+        start_year = _FAERS_DATA_START_YEAR
+
+    try:
+        end_year = (
+            int(end_date[:4])
+            if end_date
+            else datetime.datetime.now(datetime.timezone.utc).year
+        )
+    except (TypeError, ValueError):
+        end_year = datetime.datetime.now(datetime.timezone.utc).year
+
+    if end_year < start_year:
+        return []
+
+    async def count_one_year(year: int) -> dict[str, Any]:
+        year_query = (
+            f"({base_search_query}) AND "
+            f"receivedate:[{year}0101 TO {year}1231]"
+        )
+        try:
+            response = await query_openfda(
+                endpoint="/drug/event.json",
+                params={"search": year_query, "limit": 1},
+                api_key=api_key,
+            )
+        except OpenFDAError:
+            return {"label": str(year), "count": None}
+        total = response.get("meta", {}).get("results", {}).get("total", 0)
+        return {"label": str(year), "count": total}
+
+    tasks = [count_one_year(year) for year in range(start_year, end_year + 1)]
+    results = await asyncio.gather(*tasks)
+    # Already in chronological order (range generates ascending years).
+    return list(results)
+
+
+async def _count_seriousness_subtypes(
+    search_query: str,
+    api_key: str | None,
+) -> list[dict[str, Any]]:
+    """Aggregate the six FAERS seriousness subtype flags concurrently.
+
+    Each FAERS seriousness subtype is a 1/null flag stored on its own
+    field. To answer "how many of these reports were each kind of
+    serious?" we issue six independent count queries (one per flag),
+    extract the count of records where the flag is set to "1", and
+    return them merged into one ordered list.
+
+    Concurrency via asyncio.gather brings the wall-clock cost back down
+    to a single round-trip's worth — the queries don't block each other.
+    """
+    async def count_one(field: str, label: str) -> dict[str, Any]:
+        try:
+            response = await query_openfda(
+                endpoint="/drug/event.json",
+                params={
+                    "search": search_query,
+                    "count": field,
+                    "limit": 5,
+                },
+                api_key=api_key,
+            )
+        except OpenFDAError:
+            # Don't blow up the whole pivot if one subtype call fails;
+            # surface the absence with count=None so the LLM can see
+            # the gap rather than mistake it for a true zero.
+            return {"label": label, "count": None}
+
+        # The "1" bucket is set-true; "2"/null is set-false. We only
+        # report the count of set-true. Some FAERS records omit the
+        # flag entirely (not 1 or 2), which is treated as not-serious.
+        for entry in response.get("results", []):
+            if str(entry.get("term")) == "1":
+                return {"label": label, "count": entry.get("count", 0)}
+        return {"label": label, "count": 0}
+
+    tasks = [count_one(field, label) for field, label in _SERIOUSNESS_SUBTYPE_FIELDS]
+    results = await asyncio.gather(*tasks)
+    return list(results)
+
+
+async def _count_with_pivot(
+    drug_name: str,
+    pivot: str,
+    reaction: str | None,
+    start_date: str | None,
+    end_date: str | None,
+    min_age: int | None,
+    max_age: int | None,
+    country: str | None,
+    limit: int,
+) -> dict[str, Any]:
+    """Shared implementation for count_adverse_events and count_reactions.
+
+    Builds the same search query as `search_drug_adverse_events` so the
+    filter semantics are identical across the two tools. Dispatches on
+    the requested pivot to either a single-call openFDA count query or
+    the multi-call seriousness_subtype handler.
+    """
+    if pivot not in VALID_PIVOTS:
+        return {
+            "error": f"Unknown pivot: {pivot!r}",
+            "valid_pivots": list(VALID_PIVOTS),
+        }
+
+    search_query = _build_adverse_event_search(
+        drug_name=drug_name,
+        reaction=reaction,
+        start_date=start_date,
+        end_date=end_date,
+        min_age=min_age,
+        max_age=max_age,
+        country=country,
+    )
+
+    # Step 1: get the total. This anchors the counts ("X out of Y") and
+    # also tells us when the filter set is empty so we can short-circuit.
+    try:
+        meta_response = await query_openfda(
+            endpoint="/drug/event.json",
+            params={"search": search_query, "limit": 1},
+        )
+    except OpenFDAError as e:
+        return {
+            "error": "openFDA filter query failed",
+            "detail": str(e),
+            "search_query": search_query,
+        }
+
+    total = meta_response.get("meta", {}).get("results", {}).get("total", 0)
+
+    if total == 0:
+        return {
+            "drug_name": drug_name,
+            "pivot": pivot,
+            "total_matching": 0,
+            "counts": [],
+        }
+
+    # Step 2: get the pivot counts.
+    if pivot == "seriousness_subtype":
+        counts = await _count_seriousness_subtypes(search_query, api_key=None)
+        # Order by count descending (most-frequent subtype first).
+        counts = sorted(
+            counts,
+            key=lambda c: (c.get("count") or 0),
+            reverse=True,
+        )
+    elif pivot == "year":
+        # Multi-call: one count query per year in the window.
+        counts = await _count_by_year(
+            search_query,
+            start_date=start_date,
+            end_date=end_date,
+            api_key=None,
+        )
+    else:
+        try:
+            count_response = await query_openfda(
+                endpoint="/drug/event.json",
+                params={
+                    "search": search_query,
+                    "count": _PIVOT_FIELD_MAP[pivot],
+                    "limit": max(1, min(limit, 100)),
+                },
+            )
+        except OpenFDAError as e:
+            return {
+                "error": "openFDA count query failed",
+                "detail": str(e),
+                "pivot": pivot,
+                "search_query": search_query,
+            }
+
+        raw_results = count_response.get("results", [])
+        counts = [_label_pivot_count(pivot, item) for item in raw_results]
+
+        # concomitant_drug: filter out the search drug itself, since it
+        # appears in every matching record by definition.
+        if pivot == "concomitant_drug":
+            target = drug_name.strip().upper()
+            counts = [
+                c for c in counts
+                if (c.get("label") or "").upper() != target
+            ]
+
+    response: dict[str, Any] = {
+        "drug_name": drug_name,
+        "pivot": pivot,
+        "total_matching": total,
+        "counts": counts,
+    }
+
+    # Narrowing hint: only relevant for unbounded-cardinality pivots.
+    # seriousness_subtype is exactly six fixed buckets; year is small
+    # by definition; the others can be wide.
+    if pivot in ("reaction", "country", "reporter_qualification", "concomitant_drug"):
+        if len(counts) >= max(1, min(limit, 100)):
+            response["narrowing_hint"] = (
+                f"Returned the top {len(counts)} {pivot} values out of "
+                f"{total} matching reports. Add filters (date range, "
+                "reaction, country, age) to narrow the match set."
+            )
+
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Tool: count_adverse_events
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def count_adverse_events(
+    drug_name: str,
+    pivot: str = "reaction",
+    reaction: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    min_age: int | None = None,
+    max_age: int | None = None,
+    country: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Aggregate FAERS adverse-event counts across a chosen pivot dimension.
+
+    Same filter semantics as search_drug_adverse_events (broad drug-name
+    match across generic/brand/substance, optional MedDRA reaction filter,
+    ISO date range, age range, country). Returns the count of matching
+    records grouped by the requested pivot.
+
+    Supported pivots:
+        - "reaction" (default): MedDRA Preferred Term distribution.
+          Same data as the count summary in search_drug_adverse_events,
+          but exposed as its own tool for explicit aggregate queries.
+        - "country": Reports grouped by primarysource.reportercountry.
+          Useful for geographic distribution questions.
+        - "year": Reports grouped by year of receivedate. Returned in
+          chronological order for trend analysis.
+        - "reporter_qualification": Reports grouped by who filed them
+          (Physician, Pharmacist, Consumer, etc.) using the ICH E2B
+          qualification codes, translated to labels.
+        - "concomitant_drug": Other drugs co-reported in the same
+          records. The search drug itself is filtered out of the result
+          (every matching record has it by definition). Caveat: openFDA
+          does not natively distinguish suspect vs. concomitant drugs
+          in the count query, so the result includes drugs the report
+          characterized as suspect alongside true concomitants.
+        - "seriousness_subtype": Counts across the six FAERS seriousness
+          flags (Death, Life-threatening, Hospitalization, Disabling,
+          Congenital anomaly, Other medically important). Returns the
+          number of reports flagged for each subtype, sorted descending.
+
+    Args:
+        drug_name: Drug name to search (matched broadly across generic,
+            brand, and substance — same as search_drug_adverse_events).
+        pivot: One of "reaction", "country", "year",
+            "reporter_qualification", "concomitant_drug", or
+            "seriousness_subtype". Defaults to "reaction".
+        reaction: Optional MedDRA Preferred Term filter (applies BEFORE
+            the pivot is computed).
+        start_date: Optional ISO YYYY-MM-DD lower bound on receivedate.
+        end_date: Optional ISO YYYY-MM-DD upper bound on receivedate.
+        min_age: Optional minimum patient age in years.
+        max_age: Optional maximum patient age in years.
+        country: Optional 2-letter ISO country filter.
+        limit: Maximum number of distinct pivot values returned for
+            single-call pivots (ignored for seriousness_subtype, which
+            always returns six). Default 25, max 100.
+
+    Returns:
+        A dict with:
+            drug_name: echo of the input.
+            pivot: which pivot was used.
+            total_matching: total reports matching the filter set.
+            counts: list of {label, count} pairs.
+            narrowing_hint: optional, when the pivot returned its full
+                limit (suggesting more values exist).
+    """
+    return await _count_with_pivot(
+        drug_name=drug_name,
+        pivot=pivot,
+        reaction=reaction,
+        start_date=start_date,
+        end_date=end_date,
+        min_age=min_age,
+        max_age=max_age,
+        country=country,
+        limit=limit,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Tool: count_reactions (shortcut for the most common pivot)
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def count_reactions(
+    drug_name: str,
+    reaction: str | None = None,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    min_age: int | None = None,
+    max_age: int | None = None,
+    country: str | None = None,
+    limit: int = 25,
+) -> dict[str, Any]:
+    """Top MedDRA Preferred Terms reported with a drug.
+
+    Convenience tool. Equivalent to count_adverse_events(
+    drug_name, pivot="reaction", ...) but exposed as its own tool so the
+    LLM can find it by name for the most common PV question:
+    "what reactions are reported with this drug?"
+
+    Same filter semantics and response shape as count_adverse_events
+    with pivot="reaction". See that tool's documentation for arg detail.
+
+    Args:
+        drug_name: Drug name to search (broad match across generic,
+            brand, and substance).
+        reaction: Optional MedDRA PT filter applied before counting
+            (useful for narrowing to a clinical area).
+        start_date, end_date: ISO YYYY-MM-DD bounds on receivedate.
+        min_age, max_age: Patient age range in years.
+        country: 2-letter ISO country code filter.
+        limit: Top N reactions returned (default 25, max 100).
+
+    Returns:
+        Same shape as count_adverse_events with pivot="reaction".
+    """
+    return await _count_with_pivot(
+        drug_name=drug_name,
+        pivot="reaction",
+        reaction=reaction,
+        start_date=start_date,
+        end_date=end_date,
+        min_age=min_age,
+        max_age=max_age,
+        country=country,
+        limit=limit,
+    )
 
 
 # ---------------------------------------------------------------------------
