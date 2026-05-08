@@ -4,6 +4,50 @@ Running record of architectural decisions. Reverse chronological — newest at t
 
 ---
 
+## Session 03 — 2026-05-07 (continuation of Session 02)
+
+### D020 — Recall classification surfaced with description, not just code
+- **Decision:** `search_drug_recalls` returns `class_description` alongside `classification` ("Class I" + "Most serious - use of product can cause serious health problems or death").
+- **Rationale:** Same principle as the FAERS code translations: a portfolio response should be readable without an external reference card. Class I/II/III meanings aren't widely known outside of regulatory work.
+
+### D019 — Recall firm-name match: tokenized for single-word, phrase for multi-word
+- **Decision:** "Pfizer" (single word) uses tokenized match — catches "PFIZER INC", "Pfizer Inc", "Pfizer Pharmaceuticals". "Pfizer Inc" (multi-word) uses phrase match.
+- **Rationale:** Most users pass the company short name; tokenized match is the natural behavior. Multi-word inputs are the user explicitly being specific, so phrase match is correct there.
+
+### D018 — Recall classification and status validated upfront
+- **Decision:** `search_drug_recalls` validates `classification` against ("Class I", "Class II", "Class III") and `status` against ("Ongoing", "Terminated", "Completed", "Pending") before issuing the openFDA query. Returns a clear corrective error with the valid set if the input is wrong.
+- **Rationale:** A silent empty result is worse than a clear error. The LLM can self-correct given a list of valid values.
+
+### D017 — Recall tool requires drug_name OR firm
+- **Decision:** `search_drug_recalls` makes both `drug_name` and `firm` optional but requires at least one. Validation upfront with a clear error.
+- **Rationale:** Both query patterns are PV-legitimate ("recalls for metformin" and "recalls by Pfizer"). README promises both. But "all recalls everywhere" is too broad for v0.1.
+
+### D016 — get_drug_label per-section truncation with inline recovery affordance
+- **Decision:** Each label section is truncated to 4,000 characters by default (configurable via `max_section_chars`). Truncated sections include an inline note telling the LLM how to retrieve more via `sections=[<section_name>]`.
+- **Rationale:** Pembrolizumab's full label is 234K characters; one call would blow the LLM context window. Inline recovery note is more LLM-friendly than a structured "_truncated: true" flag because the LLM reads natural language directives reliably.
+
+### D015 — get_drug_label returns most recent label by effective_time
+- **Decision:** Single label, picked by `sort=effective_time:desc`. `manufacturer_name` exposed in the response so the LLM can see whose label was returned.
+- **Rationale:** Per the design question (Q2 in Session 02 NEXT_STEPS), most-recent is the cleanest answer to "what does the label say today?" Manufacturer-aware queries deferred to v0.2.
+
+### D014 — get_drug_label PV-essential section set (10 sections)
+- **Decision:** Default returns boxed_warning, adverse_reactions, warnings_and_cautions, contraindications, drug_interactions, indications_and_usage, dosage_and_administration, pregnancy, pediatric_use, geriatric_use. `sections=[...]` parameter allows targeted overrides.
+- **Rationale:** PV review workflow needs the safety triad (boxed/warnings/AE), the contraindications + interactions, the basic clinical context (indications + dosage), and the special-population sections. Skipping clinical_pharmacology, mechanism_of_action, clinical_studies, how_supplied — important but not the primary PV view.
+
+### D013 — count_adverse_events: hybrid architecture (general tool + count_reactions shortcut)
+- **Decision:** `count_adverse_events(drug_name, pivot, ...)` accepts all six pivots; `count_reactions(...)` is a separate `@mcp.tool()` that wraps it with `pivot="reaction"`.
+- **Rationale:** General tool is API-flexible for the LLM; named shortcut tool is more discoverable for the most common PV question. No code duplication — both share `_count_with_pivot`.
+
+### D012b — count_adverse_events: all six pivots in v0.1
+- **Decision:** Ship reaction, country, year, reporter_qualification, concomitant_drug, seriousness_subtype all in v0.1. Two of those (year, seriousness_subtype) are multi-call patterns.
+- **Rationale:** Maximalist scope per the user's preference for portfolio rigor. Multi-call patterns use `asyncio.gather` so the wall-clock cost stays close to a single round-trip.
+
+### D012a — Year pivot uses concurrent per-year range queries
+- **Decision:** openFDA's `count=receivedate.year` doesn't actually aggregate (the syntax works in `search=` but is silently no-op in `count=`). Year pivot is implemented as one count query per year via `asyncio.gather`. Year boundaries: from start_date or 2004 (FAERS public start), to end_date or current calendar year.
+- **Rationale:** Detected during smoke test (year pivot returned empty counts on first run). The multi-call pattern is the same shape as seriousness_subtype, so the architecture is consistent.
+
+---
+
 ## Session 02 — 2026-05-07
 
 ### D012 — Two-call result-size pattern is internal, not exposed

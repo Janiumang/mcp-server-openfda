@@ -1,7 +1,7 @@
 # Current State Snapshot
 
-**Last updated:** end of Session 02 (2026-05-07)
-**Latest commit on `main`:** `923179c` — feat: add search_drug_adverse_events tool with FAERS code translations
+**Last updated:** end of Session 03 (2026-05-07) — v0.1 feature-complete
+**Latest commit on `main`:** `c04b411` — feat: add search_drug_recalls tool - v0.1 feature-complete
 
 ## Repo layout
 
@@ -17,12 +17,13 @@ mcp-server-openfda/
 ├── src/
 │   └── mcp_server_openfda/
 │       ├── __init__.py              # Re-exports main
-│       ├── server.py                # FastMCP server + tools + tool helpers
+│       ├── server.py                # FastMCP server + 6 tools + tool helpers
 │       ├── client.py                # openFDA HTTP client (async query_openfda)
 │       └── faers_codes.py           # ICH E2B code translations + helpers
 └── project_continuity/              # Working notes (this folder)
     ├── SESSION_01_SUMMARY.md
     ├── SESSION_02_SUMMARY.md
+    ├── SESSION_03_SUMMARY.md
     ├── CURRENT_STATE.md
     ├── NEXT_STEPS.md
     ├── DECISIONS_LOG.md
@@ -41,18 +42,20 @@ Transitive (via mcp/httpx): pydantic, starlette, anyio, click, typer, rich, json
 - **Console script:** `mcp-server-openfda` (defined in `pyproject.toml [project.scripts]`)
 - **Entry point:** `mcp_server_openfda:main` → `mcp.run()` → stdio JSON-RPC loop
 
-## Tools currently exposed
+## Tools currently exposed (v0.1 feature-complete)
 
 | Tool name | Purpose | Status |
 |-----------|---------|--------|
 | `ping` | Verify MCP wiring, return a fixed string | Live |
 | `search_drug_adverse_events` | FAERS report search (drug, reaction, dates, age, country) with first-N + count summary + narrowing hint | Live, smoke-tested |
+| `count_adverse_events` | FAERS aggregate counts across six pivots: reaction, country, year, reporter_qualification, concomitant_drug, seriousness_subtype | Live, smoke-tested |
+| `count_reactions` | Shortcut for count_adverse_events with pivot='reaction' | Live, smoke-tested |
+| `get_drug_label` | Most recent FDA drug label, 10 PV-essential sections, with per-section truncation + targeted re-retrieval | Live, smoke-tested |
+| `search_drug_recalls` | FDA recalls (Form 3500A enforcement) by drug or firm, with classification/status/date filters | Live, smoke-tested |
 
-## Tools planned for v0.1 (not yet built)
+## Tools planned for v0.1
 
-- `count_adverse_events` — aggregate counts via openFDA `count` parameter (pivot by reaction, country, year, etc.)
-- `get_drug_label` — drug label retrieval
-- `search_drug_recalls` — recalls by drug or firm
+All four real tools shipped. v0.1 is feature-complete pending the README pass (Jani writes prose) and an optional v0.1.0 tag.
 
 ## Build/run commands
 

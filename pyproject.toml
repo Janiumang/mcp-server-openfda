@@ -1,7 +1,7 @@
 [project]
 name = "mcp-server-openfda"
 version = "0.1.0"
-description = "Add your description here"
+description = "MCP server exposing openFDA pharmacovigilance data (FAERS adverse events, drug labels, drug recalls) as structured tools."
 readme = "README.md"
 requires-python = ">=3.11"
 dependencies = [

@@ -31,13 +31,15 @@ Items intentionally NOT addressed in the current session, plus risks to keep vis
 
 ## v0.1 work still pending (in priority order)
 
-1. ~~`search_drug_adverse_events`~~ — DONE in Session 02 (commit `923179c`, smoke-tested).
-2. **`count_adverse_events`** — aggregate via openFDA `count` parameter. Next session start point.
-3. **`get_drug_label`** — drug label retrieval.
-4. **`search_drug_recalls`** — recalls by drug or firm.
-5. **`pyproject.toml` `description` field** — currently still uv's placeholder ("Add your description here"). Polish before v0.1 tag.
-6. **README updates** — only after all four tools ship. Describe only what's shipped. Jani writes prose; Claude can suggest structure.
-7. **Test strategy** — still zero tests. Use `engineering:testing-strategy` skill before tool 3 at the latest, so we have a pattern in place before tools 3 and 4 inherit untested conventions.
+1. ~~`search_drug_adverse_events`~~ — DONE in Session 02 (commit `923179c`).
+2. ~~`count_adverse_events`~~ — DONE in Session 03 (commit `e1aee17`).
+3. ~~`count_reactions`~~ — DONE in Session 03 (commit `e1aee17`, hybrid architecture).
+4. ~~`get_drug_label`~~ — DONE in Session 03 (commit `b46bae9`).
+5. ~~`search_drug_recalls`~~ — DONE in Session 03 (commit `c04b411`). v0.1 feature-complete.
+6. ~~`pyproject.toml` description~~ — DONE end of Session 03.
+7. **README pass** — Jani writes prose. Claude critiques only. See NEXT_STEPS.md for the suggested structure.
+8. **(Optional) v0.1.0 tag** — `git tag -a v0.1.0 -m "..." && git push --tags` once README lands.
+9. **Test strategy** — still zero tests. Defer to v0.2 explicitly. Use `engineering:testing-strategy` skill at the start of v0.2 work.
 
 ## Risks to track
 
@@ -57,6 +59,23 @@ Items intentionally NOT addressed in the current session, plus risks to keep vis
 - `mcp[cli]>=1.27.0` — pinned via floor only. `uv.lock` pins the exact installed version.
 - If the SDK ships breaking changes in a minor version, `uv lock --upgrade` could pull a version that breaks our server. Defense: don't run `uv lock --upgrade` without intent.
 
-## No known bugs at end of Session 02
+## No known bugs at end of Session 03
 
-`ping` and `search_drug_adverse_events` both return correct shapes against live openFDA queries. The bug found mid-session (missing `patient.drug.` prefix on the openfda field paths) was fixed before commit. No other behavior issues identified.
+All six tools (ping, search_drug_adverse_events, count_adverse_events, count_reactions, get_drug_label, search_drug_recalls) return correct shapes against live openFDA queries. Three mid-session bugs were caught by the smoke-test pattern and fixed before commit:
+
+1. Session 02: missing `patient.drug.` prefix on openfda field paths in `_build_adverse_event_search` (caught in pembrolizumab search returning 0 results).
+2. Session 03: count_adverse_events year pivot returning empty counts because `count=receivedate.year` is silently no-op in openFDA — fixed via concurrent per-year range queries.
+3. Session 03: get_drug_label response too large for context (234K chars on pembrolizumab) — fixed via per-section truncation + targeted-section retrieval parameter.
+
+## Deferred to v0.2 (post-v0.1 ship), updated for Session 03
+
+In addition to the items already listed above:
+
+### Manufacturer-aware label queries
+- `get_drug_label` currently returns the most recent label by effective_time regardless of manufacturer (innovator vs generic). Adding an optional `manufacturer` filter would let PV reviewers see the innovator label specifically when generics exist. Not blocking for v0.1 — the brief says PV reviewers know how to handle this — but a near-term v0.2 polish.
+
+### Rate-limit handling
+- v0.1 has no retry-with-backoff. HTTP 429 is surfaced raw. Mitigation today is `OPENFDA_API_KEY` (raises limit to ~120K req/day). v0.2 candidate: exponential backoff on 429 in `client.py`.
+
+### Recall firm matching is brittle for fuzzy names
+- Single-word firm input uses tokenized match; multi-word uses phrase match. Doesn't handle typo'd or partial-multiword inputs ("Pfizer Pharma" misses "Pfizer Pharmaceuticals"). v0.2 candidate: switch to wildcard or fuzzy matching.
