@@ -1,7 +1,7 @@
 # Current State Snapshot
 
-**Last updated:** end of Session 01 (2026-05-06)
-**Latest commit on `main`:** `f4467d9`
+**Last updated:** end of Session 02 (2026-05-07)
+**Latest commit on `main`:** `923179c` — feat: add search_drug_adverse_events tool with FAERS code translations
 
 ## Repo layout
 
@@ -10,16 +10,19 @@ mcp-server-openfda/
 ├── .gitignore                       # Python defaults + .DS_Store
 ├── .python-version                  # 3.11
 ├── LICENSE                          # MIT
-├── README.md                        # Public description (untouched this session)
+├── README.md                        # Public description (untouched so far)
 ├── pyproject.toml                   # Project metadata + dependencies
 ├── uv.lock                          # Locked dep versions (committed)
 ├── .venv/                           # Local virtual env (gitignored)
 ├── src/
 │   └── mcp_server_openfda/
 │       ├── __init__.py              # Re-exports main
-│       └── server.py                # FastMCP server + ping tool
+│       ├── server.py                # FastMCP server + tools + tool helpers
+│       ├── client.py                # openFDA HTTP client (async query_openfda)
+│       └── faers_codes.py           # ICH E2B code translations + helpers
 └── project_continuity/              # Working notes (this folder)
     ├── SESSION_01_SUMMARY.md
+    ├── SESSION_02_SUMMARY.md
     ├── CURRENT_STATE.md
     ├── NEXT_STEPS.md
     ├── DECISIONS_LOG.md
@@ -28,8 +31,8 @@ mcp-server-openfda/
 
 ## Dependencies
 
-Direct: `mcp[cli]>=1.27.0`.
-Transitive (via mcp): pydantic, httpx, starlette, anyio, click, typer, rich, jsonschema, sse-starlette, uvicorn, python-dotenv, python-multipart, pyjwt, cryptography, etc. — see `uv.lock` for the full pinned list.
+Direct: `mcp[cli]>=1.27.0`, `httpx>=0.28.1`.
+Transitive (via mcp/httpx): pydantic, starlette, anyio, click, typer, rich, jsonschema, sse-starlette, uvicorn, python-dotenv, python-multipart, pyjwt, cryptography, etc. — see `uv.lock` for the full pinned list.
 
 ## MCP server identity
 
@@ -43,11 +46,11 @@ Transitive (via mcp): pydantic, httpx, starlette, anyio, click, typer, rich, jso
 | Tool name | Purpose | Status |
 |-----------|---------|--------|
 | `ping` | Verify MCP wiring, return a fixed string | Live |
+| `search_drug_adverse_events` | FAERS report search (drug, reaction, dates, age, country) with first-N + count summary + narrowing hint | Live, smoke-tested |
 
 ## Tools planned for v0.1 (not yet built)
 
-- `search_drug_adverse_events` — FAERS query with filters
-- `count_adverse_events` — aggregate counts via openFDA `count` parameter
+- `count_adverse_events` — aggregate counts via openFDA `count` parameter (pivot by reaction, country, year, etc.)
 - `get_drug_label` — drug label retrieval
 - `search_drug_recalls` — recalls by drug or firm
 

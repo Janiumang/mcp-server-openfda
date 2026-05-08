@@ -4,6 +4,36 @@ Running record of architectural decisions. Reverse chronological — newest at t
 
 ---
 
+## Session 02 — 2026-05-07
+
+### D012 — Two-call result-size pattern is internal, not exposed
+- **Decision:** `search_drug_adverse_events` runs two openFDA calls per invocation: the page query (records + total) and a separate `count=` query (top reactions across the full match set). Both happen inside one tool call; the LLM sees one structured response.
+- **Rationale:** Q1's first-N-plus-summary pattern is more useful when the LLM gets the count summary in the same response, not as a separate tool roundtrip. Two HTTP calls per tool invocation is a fair price for that. If the tool gets called heavily and we hit rate limits, revisit.
+
+### D011 — FAERS codes translated to human-readable labels at tool boundary
+- **Decision:** `_tidy_record` translates ICH E2B codes (sex, seriousness, drug characterization, reaction outcome, reporter qualification, age unit) into labels via the `faers_codes` module. Dates formatted as ISO YYYY-MM-DD. MedDRA terms in count summaries normalized to sentence case.
+- **Rationale:** A FDE-grade portfolio response should be readable without an ICH E2B reference card. PV reviewers can read codes natively; LLMs and most other readers cannot. The faers_codes module also serves as a single source of truth for the remaining three tools.
+- **Imperfection acknowledged:** MedDRA proper-noun terms ("Stevens-Johnson syndrome") get partial mis-casing under `.capitalize()`. Tracked for v0.2.
+
+### D010 — Single source-of-truth module for FAERS code translations
+- **Decision:** `faers_codes.py` holds all ICH E2B code → label tables and the date/term helpers. Tools import from it; nobody hard-codes a translation in the tool body.
+- **Rationale:** Three more tools to come. Consolidating now prevents three more places to update when (e.g.) a new FAERS code value appears.
+
+### D009 — Drug-name search is broad (Q-A → option 1)
+- **Decision:** `search_drug_adverse_events` matches across `patient.drug.openfda.generic_name`, `.brand_name`, and `.substance_name`.
+- **Rationale:** Best PV case capture. Catches reports filed under brand (Keytruda), generic (pembrolizumab), or substance. Verified during smoke test: pembrolizumab query caught records filed as both KEYTRUDA and PEMBROLIZUMAB.
+
+### D008 — MedDRA reaction filter exposed in v0.1 (Q-B → option 1)
+- **Decision:** `search_drug_adverse_events` accepts an optional `reaction: str | None` parameter, documented as expecting a MedDRA Preferred Term.
+- **Rationale:** The README's example query (pembrolizumab safety profile) implies users will want to drill into specific reactions. Adding it now is cheap and aligned with PV workflow.
+- **Limitation documented in tool description:** lay terms ("rash", "headache") underperform; MedDRA mapping is v0.2.
+
+### D007 — Seriousness filter deferred (Q-C → option 3)
+- **Decision:** v0.1 does NOT expose a seriousness filter on `search_drug_adverse_events`. Defer to v0.2 or include in `count_adverse_events`'s pivot list.
+- **Rationale:** Tight v0.1 timebox. Smaller initial surface area to test.
+
+---
+
 ## Session 01 — 2026-05-06
 
 ### D006 — GitHub auth via `gh` CLI

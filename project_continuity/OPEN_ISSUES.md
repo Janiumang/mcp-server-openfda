@@ -4,6 +4,14 @@ Items intentionally NOT addressed in the current session, plus risks to keep vis
 
 ## Deferred to v0.2 (post-v0.1 ship)
 
+### MedDRA proper-noun term casing
+- `normalize_meddra_term` uses `.capitalize()`, which mis-cases proper-noun PTs (e.g. "Stevens-Johnson syndrome" becomes "Stevens-johnson syndrome").
+- Tracked in `faers_codes.py` docstring. Fix likely needs a curated list of MedDRA proper nouns or a different normalization library.
+
+### FAERS within-record duplicates
+- Some FAERS reports list the same drug multiple times (Session 02 smoke test: report 19231401 had LENVATINIB MESYLATE listed five times). This is upstream data quality; we pass it through.
+- v0.2 candidate: deduplicate by (reported_name, generic_name, characterization) before returning.
+
 ### MedDRA terminology mapping
 - v0.1 ships pass-through search + a documented limitation.
 - v0.2 work: design a clean MedDRA mapping layer.
@@ -23,12 +31,13 @@ Items intentionally NOT addressed in the current session, plus risks to keep vis
 
 ## v0.1 work still pending (in priority order)
 
-1. **`search_drug_adverse_events`** — see `NEXT_STEPS.md` for the design.
-2. **`count_adverse_events`** — aggregate via openFDA `count` parameter.
+1. ~~`search_drug_adverse_events`~~ — DONE in Session 02 (commit `923179c`, smoke-tested).
+2. **`count_adverse_events`** — aggregate via openFDA `count` parameter. Next session start point.
 3. **`get_drug_label`** — drug label retrieval.
 4. **`search_drug_recalls`** — recalls by drug or firm.
-5. **README updates** — only after v0.1 ships, only describing what's actually shipped, written in Jani's voice (per the no-overclaiming and no-ghostwriting rules).
-6. **Test strategy** — currently zero tests. Plan a minimal test approach before tool 2 so tools 2–4 can be written test-first. Use `engineering:testing-strategy` skill.
+5. **`pyproject.toml` `description` field** — currently still uv's placeholder ("Add your description here"). Polish before v0.1 tag.
+6. **README updates** — only after all four tools ship. Describe only what's shipped. Jani writes prose; Claude can suggest structure.
+7. **Test strategy** — still zero tests. Use `engineering:testing-strategy` skill before tool 3 at the latest, so we have a pattern in place before tools 3 and 4 inherit untested conventions.
 
 ## Risks to track
 
@@ -48,6 +57,6 @@ Items intentionally NOT addressed in the current session, plus risks to keep vis
 - `mcp[cli]>=1.27.0` — pinned via floor only. `uv.lock` pins the exact installed version.
 - If the SDK ships breaking changes in a minor version, `uv lock --upgrade` could pull a version that breaks our server. Defense: don't run `uv lock --upgrade` without intent.
 
-## No known bugs at end of Session 01
+## No known bugs at end of Session 02
 
-The only running tool (`ping`) returns the expected string. Nothing else is implemented to break.
+`ping` and `search_drug_adverse_events` both return correct shapes against live openFDA queries. The bug found mid-session (missing `patient.drug.` prefix on the openfda field paths) was fixed before commit. No other behavior issues identified.
