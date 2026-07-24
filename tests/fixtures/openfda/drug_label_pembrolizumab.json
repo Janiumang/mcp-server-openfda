@@ -1,0 +1,42 @@
+{
+  "meta": {
+    "disclaimer": "openFDA data is not for clinical use.",
+    "last_updated": "2026-05-01",
+    "results": {"skip": 0, "limit": 1, "total": 1}
+  },
+  "results": [
+    {
+      "id": "abc-123",
+      "effective_time": "20260406",
+      "openfda": {
+        "generic_name": ["PEMBROLIZUMAB"],
+        "brand_name": ["KEYTRUDA"],
+        "substance_name": ["PEMBROLIZUMAB"],
+        "manufacturer_name": ["Merck Sharp & Dohme LLC"],
+        "application_number": ["BLA125514"]
+      },
+      "indications_and_usage": [
+        "1 INDICATIONS AND USAGE KEYTRUDA is a programmed death receptor-1 (PD-1) blocking antibody indicated for treatment of unresectable or metastatic melanoma."
+      ],
+      "dosage_and_administration": [
+        "2 DOSAGE AND ADMINISTRATION 200 mg every 3 weeks or 400 mg every 6 weeks."
+      ],
+      "contraindications": ["4 CONTRAINDICATIONS None."],
+      "warnings_and_cautions": [
+        "5 WARNINGS AND PRECAUTIONS Immune-mediated adverse reactions can occur in any organ system."
+      ],
+      "adverse_reactions": [
+        "6 ADVERSE REACTIONS Most common (>=20%) are fatigue, musculoskeletal pain, rash, diarrhea, pyrexia, cough, decreased appetite."
+      ],
+      "pregnancy": [
+        "8.1 Pregnancy KEYTRUDA can cause fetal harm when administered to a pregnant woman."
+      ],
+      "pediatric_use": [
+        "8.4 Pediatric Use Safety and effectiveness established in pediatric patients with melanoma, cHL, PMBCL, MCC."
+      ],
+      "geriatric_use": [
+        "8.5 Geriatric Use No overall differences in safety observed between elderly and younger patients."
+      ]
+    }
+  ]
+}

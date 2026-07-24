@@ -1,0 +1,83 @@
+{
+  "meta": {
+    "disclaimer": "openFDA data is not for clinical use.",
+    "terms": "https://open.fda.gov/terms/",
+    "license": "https://open.fda.gov/license/",
+    "last_updated": "2026-05-01",
+    "results": {
+      "skip": 0,
+      "limit": 2,
+      "total": 26425
+    }
+  },
+  "results": [
+    {
+      "safetyreportid": "19230579",
+      "receivedate": "20210507",
+      "serious": "1",
+      "primarysource": {
+        "reportercountry": "US",
+        "qualification": "5"
+      },
+      "patient": {
+        "patientonsetage": "67",
+        "patientonsetageunit": "801",
+        "patientsex": "2",
+        "drug": [
+          {
+            "medicinalproduct": "KEYTRUDA",
+            "drugcharacterization": "2",
+            "drugindication": null,
+            "openfda": {
+              "generic_name": ["PEMBROLIZUMAB"],
+              "brand_name": ["KEYTRUDA"]
+            }
+          },
+          {
+            "medicinalproduct": "LENVIMA",
+            "drugcharacterization": "1",
+            "drugindication": "UTERINE CANCER",
+            "openfda": {
+              "generic_name": ["LENVATINIB"],
+              "brand_name": ["LENVIMA"]
+            }
+          }
+        ],
+        "reaction": [
+          {"reactionmeddrapt": "Dehydration", "reactionoutcome": "2"},
+          {"reactionmeddrapt": "Hypotension", "reactionoutcome": "2"},
+          {"reactionmeddrapt": "Diarrhoea", "reactionoutcome": "6"}
+        ]
+      }
+    },
+    {
+      "safetyreportid": "19232165",
+      "receivedate": "20210507",
+      "serious": "1",
+      "primarysource": {
+        "reportercountry": "AU",
+        "qualification": "1"
+      },
+      "patient": {
+        "patientonsetage": "77",
+        "patientonsetageunit": "801",
+        "patientsex": "1",
+        "drug": [
+          {
+            "medicinalproduct": "PEMBROLIZUMAB",
+            "drugcharacterization": "1",
+            "drugindication": "Transitional cell carcinoma",
+            "openfda": {
+              "generic_name": ["PEMBROLIZUMAB"],
+              "brand_name": ["KEYTRUDA"]
+            }
+          }
+        ],
+        "reaction": [
+          {"reactionmeddrapt": "Immune-mediated hepatitis", "reactionoutcome": "1"}
+        ],
+        "patientdeath": null
+      }
+    }
+  ]
+}

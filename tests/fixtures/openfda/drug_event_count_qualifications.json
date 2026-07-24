@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "disclaimer": "openFDA data is not for clinical use.",
+    "last_updated": "2026-05-01"
+  },
+  "results": [
+    {"term": "1", "count": 49081},
+    {"term": "5", "count": 23389},
+    {"term": "3", "count": 20207},
+    {"term": "2", "count": 7162},
+    {"term": "4", "count": 38}
+  ]
+}

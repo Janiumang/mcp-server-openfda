@@ -1,0 +1,13 @@
+{
+  "meta": {
+    "disclaimer": "openFDA data is not for clinical use.",
+    "last_updated": "2026-05-01"
+  },
+  "results": [
+    {"term": "MALIGNANT NEOPLASM PROGRESSION", "count": 2619},
+    {"term": "DIARRHOEA", "count": 1613},
+    {"term": "FATIGUE", "count": 1443},
+    {"term": "DECREASED APPETITE", "count": 1159},
+    {"term": "DEATH", "count": 1146}
+  ]
+}

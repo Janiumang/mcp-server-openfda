@@ -1,0 +1,45 @@
+{
+  "meta": {
+    "disclaimer": "openFDA data is not for clinical use.",
+    "last_updated": "2026-05-01",
+    "results": {"skip": 0, "limit": 2, "total": 155}
+  },
+  "results": [
+    {
+      "recall_number": "D-0590-2025",
+      "recalling_firm": "PFIZER INC",
+      "product_description": "Vial Label: Epinephrine Injection, USP, 1mg/10mL.",
+      "reason_for_recall": "Lack of Assurance of Sterility.",
+      "classification": "Class II",
+      "status": "Ongoing",
+      "voluntary_mandated": "Voluntary: Firm initiated",
+      "recall_initiation_date": "20250804",
+      "termination_date": null,
+      "distribution_pattern": "U.S. Nationwide",
+      "product_quantity": "49,620 vials",
+      "country": "United States",
+      "openfda": {
+        "generic_name": ["EPINEPHRINE"],
+        "brand_name": ["EPINEPHRINE"]
+      }
+    },
+    {
+      "recall_number": "D-0575-2025",
+      "recalling_firm": "Pfizer",
+      "product_description": "Levoxyl (levothyroxine sodium tablets, USP), 50 mcg.",
+      "reason_for_recall": "Subpotent drug.",
+      "classification": "Class II",
+      "status": "Ongoing",
+      "voluntary_mandated": "Voluntary: Firm initiated",
+      "recall_initiation_date": "20250729",
+      "termination_date": null,
+      "distribution_pattern": "Within U.S",
+      "product_quantity": "29,004 bottles",
+      "country": "United States",
+      "openfda": {
+        "generic_name": ["LEVOTHYROXINE SODIUM"],
+        "brand_name": ["LEVOXYL"]
+      }
+    }
+  ]
+}
