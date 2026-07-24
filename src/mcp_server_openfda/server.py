@@ -1,12 +1,19 @@
 """SignalBridge for openFDA - MCP server entry point.
 
-v0.1 surface:
+v0.2 surface:
     - ping: trivial wiring check
     - search_drug_adverse_events: FAERS report search with PV-aware filters
     - count_adverse_events: FAERS aggregate counts across PV pivots
     - count_reactions: shortcut for count_adverse_events with pivot='reaction'
     - get_drug_label: most recent FDA drug label, PV-essential sections
+        (v0.2: adds optional manufacturer filter)
     - search_drug_recalls: FDA drug recalls (Form 3500A enforcement records)
+    - calculate_reporting_odds_ratio: v0.2 - disproportionality signal
+        detection metric (ROR + 95% CI + signal flag)
+
+v0.2 also adds MedDRA lay-term expansion (reaction filters accept common
+English terms like "headache" and expand to MedDRA PT sets), retry with
+exponential backoff on rate limits, and a full pytest suite.
 """
 
 from __future__ import annotations
@@ -18,6 +25,7 @@ from typing import Any
 from mcp.server.fastmcp import FastMCP
 
 from mcp_server_openfda.client import OpenFDAError, query_openfda
+from mcp_server_openfda.disproportionality import calculate_ror
 from mcp_server_openfda.faers_codes import (
     DRUG_CHARACTERIZATION,
     PATIENT_AGE_UNIT,
@@ -28,6 +36,10 @@ from mcp_server_openfda.faers_codes import (
     normalize_meddra_term,
     translate,
     translate_serious,
+)
+from mcp_server_openfda.meddra_mapping import (
+    describe_expansion,
+    expand_reaction_term,
 )
 
 # The server's MCP name. This is what Claude Desktop displays in its
@@ -91,9 +103,20 @@ def _build_adverse_event_search(
     )
     clauses.append(drug_clause)
 
-    # Optional MedDRA Preferred Term filter on reaction.
+    # Optional MedDRA reaction filter. Lay terms ("headache", "rash") are
+    # expanded via meddra_mapping into their canonical PT sets and OR-joined,
+    # so recall stays high for non-PV-fluent callers. If the term is not in
+    # the lay-term dictionary it passes through as a single-clause exact
+    # match (assumed to already be a MedDRA PT).
     if reaction:
-        clauses.append(f'patient.reaction.reactionmeddrapt:"{reaction}"')
+        pts = expand_reaction_term(reaction)
+        if len(pts) == 1:
+            clauses.append(f'patient.reaction.reactionmeddrapt:"{pts[0]}"')
+        elif len(pts) > 1:
+            or_parts = " OR ".join(
+                f'patient.reaction.reactionmeddrapt:"{pt}"' for pt in pts
+            )
+            clauses.append(f"({or_parts})")
 
     # Date range on receivedate. openFDA expects YYYYMMDD, no separators.
     if start_date or end_date:
@@ -235,11 +258,15 @@ async def search_drug_adverse_events(
     cases filed under any of the three.
 
     Important context for the calling LLM:
-        - openFDA expects MedDRA terminology for the `reaction` filter.
-          Pass a Preferred Term (PT), e.g. "Pneumonitis", "Diarrhoea",
-          "Myocardial infarction". Lay terms ("rash", "headache") may
-          underperform because FAERS does not store them. v0.2 will add
-          MedDRA mapping; for now this is a known limitation.
+        - The `reaction` filter accepts either a MedDRA Preferred Term
+          ("Pneumonitis", "Diarrhoea", "Myocardial infarction") OR a
+          common English lay term ("headache", "rash", "chest pain",
+          "shortness of breath"). Lay terms in the built-in dictionary
+          are automatically expanded to their canonical MedDRA PT set
+          and OR-joined at query time. When expansion happens, the
+          response includes a `reaction_expansion` field describing
+          what was matched. Terms not in the dictionary pass through
+          unchanged (assumed to be a MedDRA PT already).
         - Dates use ISO YYYY-MM-DD. They are mapped to FAERS receivedate.
         - Age range is matched on patient.patientonsetage in years; reports
           where age was recorded in months/days will not match age filters.
@@ -313,6 +340,13 @@ async def search_drug_adverse_events(
         "records": records,
         "top_reactions": top_reactions,
     }
+
+    # If a lay reaction term was expanded to a PT set, surface that in
+    # the response so the caller understands what was actually queried.
+    if reaction:
+        expansion = describe_expansion(reaction)
+        if expansion is not None:
+            response["reaction_expansion"] = expansion
 
     if total > safe_limit:
         top_terms = ", ".join(r["term"] for r in top_reactions[:3] if r.get("term"))
@@ -623,6 +657,12 @@ async def _count_with_pivot(
         "counts": counts,
     }
 
+    # If a lay reaction filter was expanded to a PT set, surface it.
+    if reaction:
+        expansion = describe_expansion(reaction)
+        if expansion is not None:
+            response["reaction_expansion"] = expansion
+
     # Narrowing hint: only relevant for unbounded-cardinality pivots.
     # seriousness_subtype is exactly six fixed buckets; year is small
     # by definition; the others can be wide.
@@ -793,7 +833,10 @@ _LABEL_PV_SECTIONS: tuple[str, ...] = (
 )
 
 
-def _build_label_search(drug_name: str) -> str:
+def _build_label_search(
+    drug_name: str,
+    manufacturer: str | None = None,
+) -> str:
     """Build a /drug/label.json `search` query for broad drug-name match.
 
     Important schema note: in the label endpoint the `openfda` enrichment
@@ -801,12 +844,21 @@ def _build_label_search(drug_name: str) -> str:
     `patient.drug` as in the event endpoint. This is the same schema
     surprise that bit us during tool 1's first smoke test - same broad
     name pattern, different field paths.
+
+    When manufacturer is provided, it AND-joins a manufacturer_name
+    phrase-match clause. Use it to scope "most recent label" to a
+    specific innovator (avoiding a generic's label winning by revision
+    date) or to specifically look up a generic manufacturer's label.
     """
-    return (
-        f'openfda.generic_name:"{drug_name}" '
+    name_clause = (
+        f'(openfda.generic_name:"{drug_name}" '
         f'OR openfda.brand_name:"{drug_name}" '
-        f'OR openfda.substance_name:"{drug_name}"'
+        f'OR openfda.substance_name:"{drug_name}")'
     )
+    if manufacturer:
+        manuf_clean = manufacturer.strip()
+        return f'{name_clause} AND openfda.manufacturer_name:"{manuf_clean}"'
+    return name_clause
 
 
 def _section_text(section_value: Any) -> str | None:
@@ -858,6 +910,7 @@ def _truncate_section(text: str | None, limit: int, section_name: str) -> str | 
 @mcp.tool()
 async def get_drug_label(
     drug_name: str,
+    manufacturer: str | None = None,
     sections: list[str] | None = None,
     max_section_chars: int = 4000,
 ) -> dict[str, Any]:
@@ -867,6 +920,12 @@ async def get_drug_label(
     name matching across generic, brand, and active substance, then
     returns the most recently effective label. "Most recent" is decided
     by openFDA's effective_time field, sorted descending.
+
+    When multiple manufacturers ship the same drug (innovator + generics),
+    the most-recently-revised label may not be the innovator's. Use the
+    optional `manufacturer` argument to scope the query to a specific
+    firm (e.g. "Merck Sharp & Dohme LLC" for Keytruda's innovator label,
+    or a generic manufacturer's exact name to see their revision).
 
     By default returns ten PV-essential sections (when present):
         - boxed_warning
@@ -894,9 +953,8 @@ async def get_drug_label(
     `sections` parameter.
 
     Important context for the calling LLM:
-        - Most recently revised label may not be the brand-name innovator
-          label; it could be a generic manufacturer's most recent
-          submission. v0.2 will add an optional manufacturer filter.
+        - Without `manufacturer`, the most-recently-revised label wins
+          regardless of who submitted it. Use `manufacturer` to disambiguate.
         - Each section is a single rendered string (multiple SPL XML
           chunks joined with two newlines).
         - To see the full text of a long section, re-call with
@@ -906,6 +964,10 @@ async def get_drug_label(
     Args:
         drug_name: Drug name to look up. Matched broadly across generic,
             brand, and substance fields.
+        manufacturer: Optional exact manufacturer name (matches
+            openfda.manufacturer_name as a phrase). Use to force
+            innovator-only or specific-generic label retrieval when
+            multiple manufacturers ship the same drug.
         sections: Optional list of section names to return. When omitted,
             all ten PV-essential sections are returned. Useful for
             zooming into a specific section after seeing it truncated.
@@ -936,7 +998,7 @@ async def get_drug_label(
 
     safe_max_chars = max(500, max_section_chars)
 
-    search_query = _build_label_search(drug_name)
+    search_query = _build_label_search(drug_name, manufacturer=manufacturer)
 
     try:
         response = await query_openfda(
@@ -1219,6 +1281,282 @@ async def search_drug_recalls(
             "Consider narrowing by classification (Class I/II/III), status "
             "(Ongoing/Terminated/Completed/Pending), date range, or firm."
         )
+
+    return response
+
+
+# ---------------------------------------------------------------------------
+# Helpers for calculate_reporting_odds_ratio
+# ---------------------------------------------------------------------------
+
+def _build_reaction_only_query(
+    reaction: str,
+    start_date: str | None,
+    end_date: str | None,
+    min_age: int | None,
+    max_age: int | None,
+    country: str | None,
+) -> str:
+    """Build a search query filtered to a reaction (any drug).
+
+    Used as the `N_xr` (reports containing the reaction, from any drug)
+    input for ROR. Applies the same MedDRA lay-term expansion as
+    `_build_adverse_event_search` so filter semantics stay identical.
+    """
+    clauses: list[str] = []
+
+    pts = expand_reaction_term(reaction)
+    if len(pts) == 1:
+        clauses.append(f'patient.reaction.reactionmeddrapt:"{pts[0]}"')
+    elif len(pts) > 1:
+        or_parts = " OR ".join(
+            f'patient.reaction.reactionmeddrapt:"{pt}"' for pt in pts
+        )
+        clauses.append(f"({or_parts})")
+
+    if start_date or end_date:
+        start = _date_to_openfda(start_date) if start_date else "20040101"
+        end = _date_to_openfda(end_date) if end_date else "21000101"
+        clauses.append(f"receivedate:[{start} TO {end}]")
+
+    if min_age is not None or max_age is not None:
+        lo = min_age if min_age is not None else 0
+        hi = max_age if max_age is not None else 999
+        clauses.append(f"patient.patientonsetage:[{lo} TO {hi}]")
+
+    if country:
+        clauses.append(f"primarysource.reportercountry:{country}")
+
+    return " AND ".join(clauses)
+
+
+def _build_all_reports_query(
+    start_date: str | None,
+    end_date: str | None,
+    min_age: int | None,
+    max_age: int | None,
+    country: str | None,
+) -> str:
+    """Build the "all reports in the sampling frame" query for ROR.
+
+    We need a query that matches EVERY FAERS report (subject to the same
+    date/age/country filters applied to the other three queries) so that
+    the four contingency-table cells are drawn from the same frame.
+    openFDA has no "match all" wildcard, so we use a wide receivedate
+    range that spans all FAERS data (2004 through 2100) as the base
+    when no explicit date range is provided.
+    """
+    clauses: list[str] = []
+
+    if start_date or end_date:
+        start = _date_to_openfda(start_date) if start_date else "20040101"
+        end = _date_to_openfda(end_date) if end_date else "21000101"
+        clauses.append(f"receivedate:[{start} TO {end}]")
+    else:
+        # No date bound provided - use FAERS data range.
+        clauses.append("receivedate:[20040101 TO 21000101]")
+
+    if min_age is not None or max_age is not None:
+        lo = min_age if min_age is not None else 0
+        hi = max_age if max_age is not None else 999
+        clauses.append(f"patient.patientonsetage:[{lo} TO {hi}]")
+
+    if country:
+        clauses.append(f"primarysource.reportercountry:{country}")
+
+    return " AND ".join(clauses)
+
+
+async def _get_total(search_query: str) -> int | None:
+    """Run a limit=1 query and return the meta.results.total.
+
+    Returns None when openFDA is unreachable / errors; callers should
+    surface that up as a failed ROR computation rather than pretending
+    the count was zero (which would corrupt the ratio).
+    """
+    try:
+        response = await query_openfda(
+            endpoint="/drug/event.json",
+            params={"search": search_query, "limit": 1},
+        )
+    except OpenFDAError:
+        return None
+    return response.get("meta", {}).get("results", {}).get("total", 0)
+
+
+# ---------------------------------------------------------------------------
+# Tool: calculate_reporting_odds_ratio
+# ---------------------------------------------------------------------------
+
+@mcp.tool()
+async def calculate_reporting_odds_ratio(
+    drug_name: str,
+    reaction: str,
+    start_date: str | None = None,
+    end_date: str | None = None,
+    min_age: int | None = None,
+    max_age: int | None = None,
+    country: str | None = None,
+) -> dict[str, Any]:
+    """Compute the Reporting Odds Ratio (ROR) for a drug-reaction pair.
+
+    ROR is a foundational pharmacovigilance signal-detection metric that
+    quantifies whether a drug-adverse-reaction combination is reported
+    disproportionately often in FAERS versus the background rate. The
+    tool fetches four count queries against openFDA in parallel, builds
+    the 2x2 contingency table, and returns ROR + 95% confidence interval
+    + a signal flag using standard PV criteria.
+
+    Contingency table cells:
+        a = reports with THIS drug AND THIS reaction
+        b = reports with THIS drug but NOT this reaction
+        c = reports with OTHER drugs AND this reaction
+        d = reports with OTHER drugs and NOT this reaction
+
+        ROR = (a * d) / (b * c)
+
+    Signal criteria (standard PV convention):
+        - ROR > 1.0 (positive association)
+        - 95% CI lower bound > 1.0 (statistically distinguishable from 1)
+        - a >= 3 (at least 3 co-reports for stability)
+
+    Important context for the calling LLM:
+        - The `reaction` argument accepts either a MedDRA Preferred Term
+          or a common English lay term (same expansion rules as
+          search_drug_adverse_events).
+        - Date, age, and country filters apply CONSISTENTLY to all four
+          queries so the contingency table cells are drawn from the same
+          sampling frame. Do not compare RORs across different filter
+          sets.
+        - ROR is a spontaneous-reporting-signal metric, NOT a measure of
+          incidence, prevalence, or causality. Elevated ROR means "this
+          combination is reported more often than expected"; the causal
+          question still requires clinical judgment and follow-up
+          analysis.
+
+    Args:
+        drug_name: Drug name to test (matched broadly across generic,
+            brand, and substance name fields).
+        reaction: The reaction of interest. Can be a MedDRA Preferred
+            Term or a lay term from the built-in dictionary.
+        start_date, end_date: Optional ISO YYYY-MM-DD bounds on
+            receivedate. Applied consistently to all four queries.
+        min_age, max_age: Optional patient age bounds in years.
+        country: Optional 2-letter ISO country code.
+
+    Returns:
+        Dict with:
+            drug_name, reaction: echoes of inputs
+            filters_applied: the date/age/country scope used
+            contingency_table: {a, b, c, d} the four cells
+            totals: {reports_with_drug, reports_with_reaction, reports_total}
+            ror: The point estimate. May be 0.0 (no co-reports), None
+                (degenerate table), or a positive float.
+            ci_95_lower, ci_95_upper: 95% confidence interval bounds,
+                or None when the CI is undefined.
+            signal: True/False/None (see signal criteria above).
+            signal_criteria: Human-readable description of the criteria.
+            reaction_expansion: Metadata when a lay term was expanded.
+            notes: Interpretive caveats (small n, degenerate cell, etc.).
+        Or {"error": "..."} when one or more count queries failed.
+    """
+    drug_and_reaction_q = _build_adverse_event_search(
+        drug_name=drug_name,
+        reaction=reaction,
+        start_date=start_date,
+        end_date=end_date,
+        min_age=min_age,
+        max_age=max_age,
+        country=country,
+    )
+    drug_only_q = _build_adverse_event_search(
+        drug_name=drug_name,
+        reaction=None,
+        start_date=start_date,
+        end_date=end_date,
+        min_age=min_age,
+        max_age=max_age,
+        country=country,
+    )
+    reaction_only_q = _build_reaction_only_query(
+        reaction=reaction,
+        start_date=start_date,
+        end_date=end_date,
+        min_age=min_age,
+        max_age=max_age,
+        country=country,
+    )
+    all_reports_q = _build_all_reports_query(
+        start_date=start_date,
+        end_date=end_date,
+        min_age=min_age,
+        max_age=max_age,
+        country=country,
+    )
+
+    # Fetch all four totals concurrently - one round-trip's wall clock.
+    a, n_ax, n_xr, n = await asyncio.gather(
+        _get_total(drug_and_reaction_q),
+        _get_total(drug_only_q),
+        _get_total(reaction_only_q),
+        _get_total(all_reports_q),
+    )
+
+    if None in (a, n_ax, n_xr, n):
+        return {
+            "error": "One or more openFDA count queries failed. ROR cannot be "
+            "computed without all four contingency-table cells.",
+            "partial_totals": {
+                "a_drug_and_reaction": a,
+                "n_reports_with_drug": n_ax,
+                "n_reports_with_reaction": n_xr,
+                "n_reports_total": n,
+            },
+        }
+
+    result = calculate_ror(
+        reports_with_drug_and_reaction=a,
+        reports_with_drug_total=n_ax,
+        reports_with_reaction_total=n_xr,
+        reports_total=n,
+    )
+
+    response: dict[str, Any] = {
+        "drug_name": drug_name,
+        "reaction": reaction,
+        "filters_applied": {
+            "start_date": start_date,
+            "end_date": end_date,
+            "min_age": min_age,
+            "max_age": max_age,
+            "country": country,
+        },
+        "contingency_table": {
+            "a_drug_and_reaction": result.a,
+            "b_drug_no_reaction": result.b,
+            "c_reaction_no_drug": result.c,
+            "d_neither": result.d,
+        },
+        "totals": {
+            "reports_with_drug": n_ax,
+            "reports_with_reaction": n_xr,
+            "reports_total": n,
+        },
+        "ror": result.ror,
+        "ci_95_lower": result.ci_95_lower,
+        "ci_95_upper": result.ci_95_upper,
+        "signal": result.signal,
+        "signal_criteria": (
+            "ROR > 1.0 AND 95% CI lower bound > 1.0 AND >= 3 co-reports"
+        ),
+    }
+
+    expansion = describe_expansion(reaction)
+    if expansion is not None:
+        response["reaction_expansion"] = expansion
+
+    if result.notes:
+        response["notes"] = result.notes
 
     return response
 

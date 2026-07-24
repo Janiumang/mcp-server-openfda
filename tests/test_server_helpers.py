@@ -147,6 +147,41 @@ class TestBuildAdverseEventSearch:
         # Every optional clause should be present, all joined by AND.
         assert q.count(" AND ") == 4  # 5 clauses -> 4 joins
 
+    def test_lay_term_reaction_expands_to_or_clause(self):
+        """'headache' should expand to multiple MedDRA PTs joined with OR."""
+        q = _build_adverse_event_search(
+            drug_name="x",
+            reaction="headache",
+            start_date=None,
+            end_date=None,
+            min_age=None,
+            max_age=None,
+            country=None,
+        )
+        # Should contain a parenthesized OR clause with the mapped PTs.
+        assert 'patient.reaction.reactionmeddrapt:"Headache"' in q
+        assert 'patient.reaction.reactionmeddrapt:"Migraine"' in q
+        assert " OR " in q
+        # And it should be wrapped in parens so it interacts with outer AND.
+        assert "(patient.reaction.reactionmeddrapt:" in q
+
+    def test_meddra_pt_reaction_passes_through_as_single_clause(self):
+        """A term not in the lay dictionary stays as a single exact-match clause."""
+        # "Cardiac tamponade" is a real MedDRA PT that is not in our
+        # lay-term dictionary, so it must pass through unchanged.
+        q = _build_adverse_event_search(
+            drug_name="x",
+            reaction="Cardiac tamponade",
+            start_date=None,
+            end_date=None,
+            min_age=None,
+            max_age=None,
+            country=None,
+        )
+        assert 'patient.reaction.reactionmeddrapt:"Cardiac tamponade"' in q
+        # No OR clause for single-PT match.
+        assert "OR patient.reaction" not in q
+
 
 # ---------------------------------------------------------------------------
 # _tidy_record: FAERS record -> PV-friendly subset with translations
@@ -246,6 +281,22 @@ class TestBuildLabelSearch:
         assert 'openfda.substance_name:"pembrolizumab"' in q
         # And it should NOT include patient.drug. prefix.
         assert "patient.drug.openfda" not in q
+
+    def test_no_manufacturer_omits_manufacturer_clause(self):
+        q = _build_label_search("pembrolizumab")
+        assert "manufacturer_name" not in q
+
+    def test_manufacturer_adds_phrase_match_and_clause(self):
+        q = _build_label_search("pembrolizumab", manufacturer="Merck Sharp & Dohme LLC")
+        # AND joins the name clause with the manufacturer phrase-match.
+        assert 'openfda.manufacturer_name:"Merck Sharp & Dohme LLC"' in q
+        assert " AND " in q
+
+    def test_manufacturer_strips_whitespace(self):
+        q = _build_label_search(
+            "pembrolizumab", manufacturer="  Merck Sharp & Dohme LLC  "
+        )
+        assert 'openfda.manufacturer_name:"Merck Sharp & Dohme LLC"' in q
 
 
 # ---------------------------------------------------------------------------
