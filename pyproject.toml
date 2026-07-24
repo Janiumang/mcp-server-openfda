@@ -1,13 +1,54 @@
 [project]
 name = "mcp-server-openfda"
-version = "0.1.0"
-description = "MCP server exposing openFDA pharmacovigilance data (FAERS adverse events, drug labels, drug recalls) as structured tools."
+version = "0.2.0"
+description = "MCP server exposing openFDA pharmacovigilance data (FAERS adverse events, drug labels, drug recalls, ROR signal detection) as structured tools for Claude and other MCP-compatible clients."
 readme = "README.md"
 requires-python = ">=3.11"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [
+    { name = "Umang Jani", email = "umangjani215@gmail.com" },
+]
+keywords = [
+    "mcp",
+    "model-context-protocol",
+    "openfda",
+    "pharmacovigilance",
+    "fda",
+    "faers",
+    "adverse-events",
+    "drug-labels",
+    "drug-recalls",
+    "meddra",
+    "reporting-odds-ratio",
+    "signal-detection",
+    "signalbridge",
+    "claude",
+    "anthropic",
+]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Healthcare Industry",
+    "Intended Audience :: Science/Research",
+    "Operating System :: OS Independent",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Scientific/Engineering :: Bio-Informatics",
+    "Topic :: Scientific/Engineering :: Medical Science Apps.",
+    "Typing :: Typed",
+]
 dependencies = [
     "httpx>=0.28.1",
     "mcp[cli]>=1.27.0",
 ]
+
+[project.urls]
+Homepage = "https://github.com/Janiumang/mcp-server-openfda"
+Repository = "https://github.com/Janiumang/mcp-server-openfda"
+Issues = "https://github.com/Janiumang/mcp-server-openfda/issues"
+Changelog = "https://github.com/Janiumang/mcp-server-openfda/commits/main"
 
 [project.scripts]
 mcp-server-openfda = "mcp_server_openfda:main"
